@@ -1,7 +1,7 @@
 {
   "peer_id": 3,
   "data_size": 2857,
-  "final_accuracy": 0.6846,
+  "final_accuracy": 0.6638,
   "avg_partners_per_round": 3.0,
   "solo_rounds": 0
 }

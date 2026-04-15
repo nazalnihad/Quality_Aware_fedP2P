@@ -15,6 +15,12 @@ def _make_data_sizes(num_peers, total_samples):
 # Similarity band: a peer is eligible if its data_size >= my_data_size * (1 - TIER_BAND)
 # Set to 1.0 to disable the lower bound (only upper bound: data_size <= my_data_size)
 TIER_BAND = 0.40
+# Reputation gate for downward aggregation:
+#   REP_THRESHOLD  – min reputation a smaller peer must have before a richer
+#                    peer accepts its model (0.0 = accept all, 1.0 = never)
+#   REP_EMA_ALPHA  – weight of new quality score vs. old reputation (EMA)
+REP_THRESHOLD  = 0.55   # tune: lower = more inclusive, higher = stricter
+REP_EMA_ALPHA  = 0.2    # 0.2 → reputation changes slowly over ~5 rounds
 BASE_PORT = 5000
 
 NUM_ROUNDS = 100
