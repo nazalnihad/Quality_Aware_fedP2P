@@ -142,11 +142,15 @@ def get_peer_dataloader(dataset_name, peer_id, num_peers, num_samples, batch_siz
 
 
 def get_peer_dataloader_sized(dataset_name, peer_id, data_size, batch_size,
-                              iid=True, alpha=0.5):
+                               split_mode="iid", alpha=0.5, class_map=None):
     """
-    Like get_peer_dataloader but the caller passes an explicit data_size
-    for this peer instead of splitting equally across all peers.
-    Uses peer_id only as a random seed offset so peers get different subsets.
+    Build train and local-validation loaders for a single peer.
+
+    split_mode: "iid"          — stratified balanced sampling
+                "non_iid"      — Dirichlet distribution (controlled by alpha)
+                "manual_skew"  — only classes listed in class_map[peer_id]
+
+    Returns (train_loader, local_val_loader) with an 80/20 split.
     """
     full_dataset = DATASET_CLASS[dataset_name](
         root='data', train=True, download=True,
@@ -154,14 +158,38 @@ def get_peer_dataloader_sized(dataset_name, peer_id, data_size, batch_size,
     )
 
     # Use a deterministic per-peer seed so subsets don't overlap
-    rng = random.Random(42 + peer_id)
-    np_rng = np.random.default_rng(42 + peer_id)
+    # We use a global SEED from config so all peers use a synchronized starting point
+    from config import SEED
+    rng = random.Random(SEED + peer_id)
+    np_rng = np.random.default_rng(SEED + peer_id)
 
     targets = np.array(full_dataset.targets)
     num_classes = 10
 
-    if iid:
-        # Stratified: equal samples per class
+    if split_mode == "manual_skew":
+        # ── Manual skew: peer only gets the classes defined in class_map ──
+        if class_map is None or peer_id not in class_map:
+            raise ValueError(f"manual_skew requires class_map entry for peer {peer_id}")
+        allowed_classes = class_map[peer_id]
+        samples_per_class = data_size // len(allowed_classes)
+        indices = []
+        for c in allowed_classes:
+            class_idx = np.where(targets == c)[0].tolist()
+            n = min(samples_per_class, len(class_idx))
+            chosen = rng.sample(class_idx, n)
+            indices.extend(chosen)
+        # Fix rounding so total == data_size
+        deficit = data_size - len(indices)
+        if deficit > 0:
+            c = allowed_classes[0]
+            class_idx = np.where(targets == c)[0].tolist()
+            already = set(indices)
+            remaining = [i for i in class_idx if i not in already]
+            indices.extend(rng.sample(remaining, min(deficit, len(remaining))))
+        rng.shuffle(indices)
+
+    elif split_mode == "iid":
+        # ── IID: stratified balanced sampling ──
         samples_per_class = data_size // num_classes
         indices = []
         for c in range(num_classes):
@@ -169,29 +197,31 @@ def get_peer_dataloader_sized(dataset_name, peer_id, data_size, batch_size,
             chosen = rng.sample(class_idx, min(samples_per_class, len(class_idx)))
             indices.extend(chosen)
         rng.shuffle(indices)
-    else:
-        # Non-IID: Dirichlet over classes
-        samples_per_class = data_size // num_classes
-        indices = []
-        for c in range(num_classes):
-            class_idx = np.where(targets == c)[0].tolist()
-            n = min(samples_per_class, len(class_idx))
-            chosen = rng.sample(class_idx, n)
-            indices.extend(chosen)
-        # Apply Dirichlet-style skew: randomly subsample with class bias
+
+    else:  # non_iid
+        # ── Non-IID: Dirichlet over classes ──
         proportions = np_rng.dirichlet([alpha] * num_classes)
         per_class_counts = (proportions * data_size).astype(int)
         per_class_counts[per_class_counts.argmax()] += data_size - per_class_counts.sum()
-        skewed = []
+        indices = []
         for c in range(num_classes):
             class_idx = np.where(targets == c)[0].tolist()
             n = min(int(per_class_counts[c]), len(class_idx))
-            skewed.extend(rng.sample(class_idx, n))
-        indices = skewed
+            indices.extend(rng.sample(class_idx, n))
         rng.shuffle(indices)
 
-    peer_dataset = Subset(full_dataset, indices)
-    return DataLoader(peer_dataset, batch_size=batch_size, shuffle=True)
+    # ── 80/20 train / local-validation split ──
+    split_point = int(len(indices) * 0.8)
+    train_indices = indices[:split_point]
+    val_indices = indices[split_point:]
+
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    return train_loader, val_loader
 
 
 def get_test_dataloader(dataset_name, batch_size):

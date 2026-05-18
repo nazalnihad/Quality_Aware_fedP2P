@@ -8,6 +8,11 @@ app = Flask(__name__)
 model_buffer = {}
 buffer_lock = threading.Lock()
 
+# Reward buffer: rich peers push their aggregated model here as a reward
+# key = round_num → value = state_dict (latest reward overwrites)
+reward_buffer = {}
+reward_lock = threading.Lock()
+
 # Set by peer.py after startup
 MY_DATA_SIZE = 0
 
@@ -40,6 +45,16 @@ def get_model():
         "round": MY_LATEST_ROUND,
         "state_dict": MY_LATEST_MODEL,
     })
+
+@app.route('/receive_reward', methods=['POST'])
+def receive_reward():
+    """Receive a reward model (aggregated) from a richer peer."""
+    data = request.get_json()
+    round_num = data['round']
+    state_dict = deserialize_model(data['state_dict'])
+    with reward_lock:
+        reward_buffer[round_num] = state_dict
+    return jsonify({"status": "success"})
 
 @app.route('/health', methods=['GET'])
 def health_check():

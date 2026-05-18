@@ -1,7 +1,18 @@
 {
   "peer_id": 4,
   "data_size": 2143,
-  "final_accuracy": 0.6761,
-  "avg_partners_per_round": 3.0,
-  "solo_rounds": 0
+  "agg_mode": "quality",
+  "split_mode": "manual_skew",
+  "final_accuracy": 0.9788,
+  "final_local_accuracy": 0.9837,
+  "avg_partners_per_round": 2.4,
+  "solo_rounds": 0,
+  "downward_admits": 4,
+  "upward_fallback_rounds": 0,
+  "final_reputations": {
+    "2": 0.9984,
+    "3": 0.5383,
+    "5": 0.4943,
+    "6": 0.4548
+  }
 }

@@ -1,6 +1,7 @@
 import argparse
 import time
 import random
+import math
 import os
 import torch
 import requests
@@ -11,7 +12,7 @@ from model import create_model
 from data import get_peer_dataloader_sized, get_test_dataloader
 from trainer import train_model, evaluate_model
 from topology import get_neighbours, get_peer_address
-from peer_server import start_server, model_buffer, buffer_lock
+from peer_server import start_server, model_buffer, buffer_lock, reward_buffer, reward_lock
 import peer_server
 from utils import serialize_model, deserialize_model
 from aggregator import aggregate_models
@@ -45,12 +46,14 @@ peer_server.MY_DATA_SIZE = my_data_size
 log(f"Server ready | Data size: {my_data_size} samples")
 
 # Create model and dataloaders
-log(f"Loading {DATA} dataset ({my_data_size} samples for this peer)")
+log(f"Loading {DATA} dataset ({my_data_size} samples for this peer) | mode={AGG_MODE} split={SPLIT_MODE}")
 model = create_model(DATA)
-train_loader = get_peer_dataloader_sized(DATA, peer_id, my_data_size, BATCH_SIZE,
-                                         iid=IID, alpha=ALPHA)
+train_loader, local_val_loader = get_peer_dataloader_sized(
+    DATA, peer_id, my_data_size, BATCH_SIZE,
+    split_mode=SPLIT_MODE, alpha=ALPHA, class_map=PEER_CLASS_MAP
+)
 test_loader = get_test_dataloader(DATA, BATCH_SIZE)
-log(f"Data loaded. Training batches: {len(train_loader)}, Device: {DEVICE}")
+log(f"Data loaded. Training batches: {len(train_loader)}, Local val batches: {len(local_val_loader)}, Device: {DEVICE}")
 
 
 # ── Neighbour helpers ────────────────────────────────────────────────────────
@@ -89,69 +92,105 @@ def get_eligible_neighbours(all_neighbours):
             continue
         ratio = abs(my_data_size - n_size) / max(my_data_size, n_size)
         reachable.append((n_id, n_size, ratio))
-        if ratio <= TIER_BAND:
-            # Symmetric band partner — same as before
-            eligible.append((n_id, n_size, "band"))
-        elif n_size < my_data_size:
-            # Smaller peer outside band — admit only if reputation is proven
-            rep = reputation.get(n_id, 0.0)
-            if rep >= REP_THRESHOLD:
+        if AGG_MODE == "quantity":
+            # In quantity mode, strictly one-way downward.
+            # Larger peers pull from smaller peers. Smaller peers get NOTHING.
+            # This demonstrates the "wealth extraction" flaw of traditional modes.
+            if n_size < my_data_size:
                 eligible.append((n_id, n_size, "downward"))
-                log(f"  Peer {n_id} admitted via reputation ({rep:.2f} >= {REP_THRESHOLD})")
+                log(f"  Peer {n_id} admitted (quantity mode strict downward)")
             else:
-                log(f"  Peer {n_id} excluded — below threshold "
-                    f"(rep={rep:.2f}, need {REP_THRESHOLD}, data_size={n_size})")
+                log(f"  Peer {n_id} excluded (quantity mode restricts upward pulling)")
         else:
-            log(f"  Peer {n_id} excluded — larger peer outside band "
-                f"(ratio={ratio:.2f} > {TIER_BAND})")
+            # Reputation / Quality mode connectivity
+            rep = reputation.get(n_id, 1.0)
+            if ratio <= TIER_BAND:
+                # Symmetric band partner — now hard-gated by reputation
+                if rep >= REP_THRESHOLD:
+                    eligible.append((n_id, n_size, "band"))
+                    log(f"  Peer {n_id} admitted to band via reputation ({rep:.2f} >= {REP_THRESHOLD})")
+                else:
+                    log(f"  Peer {n_id} excluded from band — below threshold "
+                        f"(rep={rep:.2f}, need {REP_THRESHOLD}, data_size={n_size})")
+            elif n_size < my_data_size:
+                # Reputation/Quality: admit only if reputation is proven
+                if rep >= REP_THRESHOLD:
+                    eligible.append((n_id, n_size, "downward"))
+                    log(f"  Peer {n_id} admitted downward via reputation ({rep:.2f} >= {REP_THRESHOLD})")
+                else:
+                    log(f"  Peer {n_id} excluded downward — below threshold "
+                        f"(rep={rep:.2f}, need {REP_THRESHOLD}, data_size={n_size})")
+            else:
+                log(f"  Peer {n_id} excluded — larger peer outside band "
+                    f"(ratio={ratio:.2f} > {TIER_BAND})")
 
     # ── Upward fallback: no band ─────────────────────────────────────────────
     # If we ended up with zero band partners, pick the closest richer peer(s)
     # as one-way upward sources so we learn *something* each round.
-    has_band = any(kind == "band" for _, _, kind in eligible)
-    if not has_band:
-        richer = [(n_id, n_size, ratio)
-                  for n_id, n_size, ratio in reachable
-                  if n_size > my_data_size]
-        if richer:
-            # Sort by closeness (smallest ratio first) and take the nearest one
-            richer.sort(key=lambda x: x[2])
-            closest_ratio = richer[0][2]
-            # Admit all peers tied at the closest ratio (typically just 1)
-            for n_id, n_size, ratio in richer:
-                if abs(ratio - closest_ratio) < 1e-6:
-                    eligible.append((n_id, n_size, "upward"))
-                    log(f"  Peer {n_id} admitted via UPWARD FALLBACK "
-                        f"(no band; ratio={ratio:.2f}, size={n_size})")
-        else:
-            log(f"  No band AND no richer peer reachable — truly solo this round")
+    if AGG_MODE != "quantity":
+        has_band = any(kind == "band" for _, _, kind in eligible)
+        if not has_band:
+            richer = [(n_id, n_size, ratio)
+                      for n_id, n_size, ratio in reachable
+                      if n_size > my_data_size]
+            if richer:
+                # Sort by closeness (smallest ratio first) and take the nearest one
+                richer.sort(key=lambda x: x[2])
+                closest_ratio = richer[0][2]
+                # Admit all peers tied at the closest ratio (typically just 1)
+                for n_id, n_size, ratio in richer:
+                    if abs(ratio - closest_ratio) < 1e-6:
+                        eligible.append((n_id, n_size, "upward"))
+                        log(f"  Peer {n_id} admitted via UPWARD FALLBACK "
+                            f"(no band; ratio={ratio:.2f}, size={n_size})")
+            else:
+                log(f"  No band AND no richer peer reachable — truly solo this round")
 
     return eligible
 
 
 def compute_rep_weight(n_id, n_size):
-    """Aggregation weight = data_size × reputation (floored at 0.1 to avoid zero)."""
+    """Aggregation weight depends on AGG_MODE:
+      quantity   → data_size
+      reputation → data_size × reputation
+      quality    → log(data_size) × reputation
+    """
+    if AGG_MODE == "quantity":
+        return float(n_size)
     rep = max(0.1, reputation.get(n_id, 1.0))
-    return n_size * rep
+    if AGG_MODE == "reputation":
+        return n_size * rep
+    else:  # quality
+        return math.log1p(n_size) * rep
 
 
 def update_reputation(n_id, incoming_state, before_state, val_loader):
-    """
-    Evaluate model before and after applying neighbour's weights on our
-    local validation set. Quality = accuracy gain (clipped to [0, 1]).
-    Updates reputation[n_id] via EMA.
+    """Score a neighbour's contribution and update their reputation via EMA.
+      reputation mode → raw replacement (load their model, test)
+      quality   mode → 50/50 mini-aggregation (blend, test)
     """
     model.load_state_dict(before_state)
     acc_before = evaluate_model(model, val_loader, DEVICE)
 
-    model.load_state_dict(incoming_state)
+    if AGG_MODE == "quality":
+        # 50/50 blend — measures contribution, not standalone strength
+        blended = aggregate_models(
+            [before_state, incoming_state],
+            weights=[1.0, 1.0]
+        )
+        model.load_state_dict(blended)
+    else:
+        # Raw replacement — load their model directly
+        model.load_state_dict(incoming_state)
+
     acc_after = evaluate_model(model, val_loader, DEVICE)
 
     # Normalise gain to [0, 1]: gain of 0 → quality 0.5 (neutral)
-    quality = 0.5 + (acc_after - acc_before)
+    # Amplified by 5.0 to give more meaning to small accuracy bumps
+    quality = 0.5 + ((acc_after - acc_before) * 5.0)
     quality = max(0.0, min(1.0, quality))
 
-    old_rep = reputation.get(n_id, 0.0)
+    old_rep = reputation.get(n_id, 1.0)
     reputation[n_id] = (1 - REP_EMA_ALPHA) * old_rep + REP_EMA_ALPHA * quality
     log(f"  Reputation Peer {n_id}: {old_rep:.3f} → {reputation[n_id]:.3f} "
         f"(quality={quality:.3f}, acc {acc_before:.3f}→{acc_after:.3f})")
@@ -169,6 +208,38 @@ def pull_model_from(n_id, round_num):
         except Exception:
             pass
         time.sleep(1)
+
+
+def send_reward(n_id, aggregated_state, round_num):
+    """Push our aggregated model to a high-rep smaller peer as a reward."""
+    url = get_peer_address(n_id, BASE_PORT) + "/receive_reward"
+    payload = {
+        "round": round_num,
+        "state_dict": serialize_model(aggregated_state),
+    }
+    try:
+        requests.post(url, json=payload, timeout=5)
+        log(f"  Reward sent to Peer {n_id}")
+    except requests.exceptions.RequestException as e:
+        log(f"  Failed to send reward to Peer {n_id}: {e}")
+
+
+def consume_reward(round_num, current_state):
+    """Check if any richer peer has pushed a reward model this round.
+    If so, blend it 50/50 with our current state to benefit from their
+    superior aggregated knowledge while preserving our own.
+    Returns the (possibly improved) state dict.
+    """
+    with reward_lock:
+        reward_state = reward_buffer.pop(round_num, None)
+    if reward_state is None:
+        return current_state
+    log(f"  Received reward model for round {round_num} — blending with own model")
+    blended = aggregate_models(
+        [current_state, reward_state],
+        weights=[1.0, 1.0]
+    )
+    return blended
 
 
 
@@ -233,62 +304,65 @@ for round_num in range(NUM_ROUNDS):
 
     # Step 2: Determine eligible neighbours
     eligible = get_eligible_neighbours(all_neighbours)
-    # Band partners require bidirectional exchange;
-    # downward/upward peers are pull-only (no send from us).
+    
+    # ALL partners are now pull-only! This prevents deadlocks and allows hard-gating everyone.
     band_ids     = [n_id for n_id, _, kind in eligible if kind == "band"]
     downward_ids = [n_id for n_id, _, kind in eligible if kind == "downward"]
     upward_ids   = [n_id for n_id, _, kind in eligible if kind == "upward"]
-    pull_ids     = downward_ids + upward_ids   # all one-way pulls
-    eligible_ids = band_ids + pull_ids
-    log(f"  Band: {band_ids} | Downward (rep-gated): {downward_ids} | "
-        f"Upward fallback: {upward_ids}")
+    pull_ids     = band_ids + downward_ids + upward_ids
+    eligible_ids = pull_ids
+    log(f"  Band: {band_ids} | Downward: {downward_ids} | Upward fallback: {upward_ids}")
 
     if eligible_ids:
         total_partners += len(eligible_ids)
         if upward_ids and not band_ids:
             upward_fallback_rounds += 1
 
-        # Step 3: Send to band partners only (symmetric).
-        # Downward/upward peers are pull-only — we don't push to them.
-        if band_ids:
-            log(f"  Sending model to band partners {band_ids}...")
-            send_to_neighbours(local_weights, round_num, band_ids)
-
-        # Step 4a: Wait for band partners to push their models
-        if band_ids:
-            log(f"  Waiting for band models from {band_ids}...")
-            wait_for_models(round_num, band_ids)
-
-        # Step 4b: Pull models from downward + upward peers directly
+        # Step 3 & 4: Pull models from ALL eligible peers (including band partners)
+        # Because we only pull MY_LATEST_MODEL (which is updated immediately after local train),
+        # there is no deadlock, and we can safely exclude toxic band partners.
         pull_models = []
         for n_id in pull_ids:
-            kind_label = "downward" if n_id in downward_ids else "upward-fallback"
+            if n_id in band_ids:
+                kind_label = "band"
+            elif n_id in downward_ids:
+                kind_label = "downward"
+            else:
+                kind_label = "upward-fallback"
             log(f"  Pulling model from {kind_label} peer {n_id}...")
             pm = pull_model_from(n_id, round_num)
             pull_models.append(pm)
-        log(f"  All neighbour models received!")
+        log(f"  All {len(pull_ids)} neighbour models received!")
 
-        # Step 5: Reputation-weighted FedAvg
-        band_models      = get_models(round_num, band_ids)
-        neighbour_models = band_models + pull_models
-        rep_weights = [compute_rep_weight(n_id, n_size)
-                       for n_id, n_size, _ in eligible]
-        all_models      = [local_weights] + neighbour_models
-        all_weights_rep = [my_data_size]  + rep_weights
+        # Step 5: Weighted FedAvg
+        neighbour_models = pull_models
+        peer_weights = [compute_rep_weight(n_id, n_size)
+                        for n_id, n_size, _ in eligible]
+        my_weight = math.log1p(my_data_size) if AGG_MODE == "quality" else float(my_data_size)
+        all_models  = [local_weights] + neighbour_models
+        all_weights = [my_weight] + peer_weights
         weight_info = ", ".join(
-            f"P{n_id}:{round(w,1)}(rep={reputation.get(n_id,1.0):.2f})"
-            for (n_id, _, _), w in zip(eligible, rep_weights)
+            f"P{n_id}:{round(w,1)}" + (f"(rep={reputation.get(n_id,0.0):.2f})" if AGG_MODE != "quantity" else "")
+            for (n_id, _, _), w in zip(eligible, peer_weights)
         )
-        log(f"  Aggregating {len(all_models)} models | my_weight={my_data_size} | {weight_info}")
-        avg_weights = aggregate_models(all_models, weights=all_weights_rep)
+        log(f"  Aggregating {len(all_models)} models [{AGG_MODE}] | my_weight={my_weight:.1f} | {weight_info}")
+        avg_weights = aggregate_models(all_models, weights=all_weights)
 
-        # Step 5b: Update reputation for each neighbour based on their contribution
-        log(f"  Updating reputations...")
-        for i, (n_id, _, _) in enumerate(eligible):
-            update_reputation(n_id, neighbour_models[i], local_weights, test_loader)
+        # Step 5b: Update reputation (skip in quantity mode)
+        if AGG_MODE != "quantity":
+            log(f"  Updating reputations...")
+            for i, (n_id, _, _) in enumerate(eligible):
+                update_reputation(n_id, neighbour_models[i], local_weights, test_loader)
+
+        # Step 5c: Reward push (quality mode only)
+        if AGG_MODE == "quality":
+            for n_id in downward_ids:
+                rep = reputation.get(n_id, 0.0)
+                if rep >= REP_THRESHOLD:
+                    send_reward(n_id, avg_weights, round_num)
 
         model.load_state_dict(avg_weights)
-        cleanup_buffer(round_num, band_ids)  # only band pushed into buffer
+        # cleanup_buffer is no longer needed since we don't use model_buffer anymore
         downward_admits += len(downward_ids)
     else:
         solo_rounds += 1
@@ -296,8 +370,16 @@ for round_num in range(NUM_ROUNDS):
         log(f"  No eligible neighbours — solo round (keeping local weights)")
         model.load_state_dict(local_weights)
 
-    # Step 6: Evaluate
+    # Step 6a: Consume any reward model pushed by a richer peer (quality mode only)
+    if AGG_MODE == "quality":
+        current_state = model.state_dict()
+        improved_state = consume_reward(round_num, current_state)
+        if improved_state is not current_state:
+            model.load_state_dict(improved_state)
+
+    # Step 6: Evaluate (global + local)
     acc = evaluate_model(model, test_loader, DEVICE)
+    local_acc = evaluate_model(model, local_val_loader, DEVICE)
     round_time = time.time() - round_start
 
     # Reputation snapshot for all known peers
@@ -306,9 +388,10 @@ for round_num in range(NUM_ROUNDS):
     ) or "none yet"
 
     log(f"  ✓ Round {round_num+1}/{NUM_ROUNDS} done | "
-        f"Acc: {acc:.4f} | Time: {round_time:.1f}s | "
+        f"Global Acc: {acc:.4f} | Local Acc: {local_acc:.4f} | Time: {round_time:.1f}s | "
         f"Band: {band_ids} | Downward: {downward_ids} | Upward: {upward_ids}")
-    log(f"  Reputations — {rep_summary}")
+    if AGG_MODE != "quantity":
+        log(f"  Reputations — {rep_summary}")
 
 # Save final model
 import json
@@ -320,7 +403,10 @@ torch.save(model.state_dict(), model_path)
 stats = {
     "peer_id": peer_id,
     "data_size": my_data_size,
+    "agg_mode": AGG_MODE,
+    "split_mode": SPLIT_MODE,
     "final_accuracy": round(acc, 4),
+    "final_local_accuracy": round(local_acc, 4),
     "avg_partners_per_round": round(total_partners / NUM_ROUNDS, 2),
     "solo_rounds": solo_rounds,
     "downward_admits": downward_admits,
@@ -332,6 +418,18 @@ with open(stats_path, "w") as f:
     json.dump(stats, f, indent=2)
 
 log(f"=== Training complete! Final model saved to {model_path} ===")
-log(f"=== [SUMMARY] Peer {peer_id} | Data: {my_data_size} samples | "
+log(f"=== [SUMMARY] Peer {peer_id} | Mode: {AGG_MODE} | Data: {my_data_size} samples | "
     f"Avg partners/round: {total_partners/NUM_ROUNDS:.1f} | "
-    f"Solo rounds: {solo_rounds}/{NUM_ROUNDS} | Final accuracy: {acc:.4f} ===")
+    f"Solo rounds: {solo_rounds}/{NUM_ROUNDS} | "
+    f"Global acc: {acc:.4f} | Local acc: {local_acc:.4f} ===")
+
+# Signal completion to run_simulation.py and stay alive to serve models
+with open(f"outputs/peer_{peer_id}_done", "w") as f:
+    f.write("done")
+
+log("Keeping server alive until all peers finish...")
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    pass

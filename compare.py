@@ -60,9 +60,9 @@ def print_comparison(rows):
 
     # ── Main table ────────────────────────────────────────────────────────────
     header = (f"  {'Peer':>4}  {'Data':>7}  {'Band Partners':>15}"
-              f"  {'Solo':>5}  {'↓Admits':>8}  {'↑Fallback':>10}  {'Accuracy':>10}")
+              f"  {'Solo':>5}  {'↓Admits':>8}  {'↑Fallback':>10}  {'Global Acc':>11}  {'Local Acc':>10}")
     print(header)
-    print("  " + "-" * 93)
+    print("  " + "-" * 105)
 
     rows_sorted = sorted(rows, key=lambda r: r["data_size"], reverse=True)
     for r in rows_sorted:
@@ -71,10 +71,12 @@ def print_comparison(rows):
         admits_str   = str(r["downward_admits"])         if r.get("downward_admits") is not None      else "?"
         fallback_str = str(r["upward_fallback_rounds"])  if r.get("upward_fallback_rounds") is not None else "?"
         acc_str      = f"{r['accuracy']*100:.2f}%"       if r["accuracy"] is not None                 else "N/A"
+        local_acc_str = f"{r['local_accuracy']*100:.2f}%" if r.get("local_accuracy") is not None      else "N/A"
+        
         print(f"  {r['peer_id']:>4}  {r['data_size']:>7}  {band_str:>15}"
-              f"  {solo_str:>5}  {admits_str:>8}  {fallback_str:>10}  {acc_str:>10}")
+              f"  {solo_str:>5}  {admits_str:>8}  {fallback_str:>10}  {acc_str:>11}  {local_acc_str:>10}")
 
-    print("  " + "-" * 93)
+    print("  " + "-" * 105)
 
     # ── Accuracy gap ──────────────────────────────────────────────────────────
     valid = [r for r in rows_sorted if r["accuracy"] is not None]
@@ -151,6 +153,7 @@ if __name__ == "__main__":
         stats = load_stats(pid)
 
         acc                   = stats.get("final_accuracy")         if stats else None
+        local_acc             = stats.get("final_local_accuracy")   if stats else None
         solo_rounds           = stats.get("solo_rounds")            if stats else None
         downward_admits       = stats.get("downward_admits")        if stats else None
         upward_fallback_rounds = stats.get("upward_fallback_rounds") if stats else None
@@ -159,11 +162,13 @@ if __name__ == "__main__":
         if args.re_eval and test_loader is not None:
             print(f"  Peer {pid} (data_size={PEER_DATA_SIZES[pid]}):")
             acc = re_evaluate(pid, test_loader)
+            local_acc = None # Re-evaluating local acc is complex, so we just use None
 
         rows.append({
             "peer_id":               pid,
             "data_size":             PEER_DATA_SIZES[pid],
             "accuracy":              acc,
+            "local_accuracy":        local_acc,
             "solo_rounds":           solo_rounds,
             "downward_admits":       downward_admits,
             "upward_fallback_rounds": upward_fallback_rounds,
