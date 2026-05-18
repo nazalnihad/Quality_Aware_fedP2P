@@ -2,9 +2,9 @@
 
 A decentralized, peer-to-peer Federated Learning framework built with PyTorch, designed to address challenges with small-data peers and Non-IID data distributions. This project introduces a **Quality-Aware Aggregation** approach, moving beyond simple quantity-based averaging to ensure high-quality model convergence even with highly skewed data.
 
-## 🧠 Architecture Overview
+## Architecture Overview
 
-Our architecture relies on a fully decentralized topology without a central parameter server. The key components include:
+The architecture relies on a fully decentralized topology without a central parameter server. The key components include:
 
 - **Universal Pull-Based Reputation Gate**: Evaluates incoming peer models dynamically. Only models that prove beneficial based on local holdout validation are accepted for aggregation.
 - **Reward Push Mechanism**: Actively rewards high-performing peers within the network, promoting quality data contributions.
@@ -14,7 +14,7 @@ Our architecture relies on a fully decentralized topology without a central para
   2. Reputation-Gated 
   3. Quality-Aware
 
-## 🚀 Running the Simulation
+## Running the Simulation
 
 Ensure you have your virtual environment activated and dependencies installed. 
 
@@ -38,7 +38,7 @@ If you want to manually run the comparison tool against the latest simulation ru
 python compare.py
 ```
 
-## 📁 Repository Structure
+## Repository Structure
 
 - `run_simulation.py`: Entry point for launching the P2P FL network.
 - `peer.py` & `peer_server.py`: Core logic for individual peer lifecycle, training, and P2P communication.
