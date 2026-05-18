@@ -3,3 +3,5 @@ __pycache__/
 *report/
 *venv/
 *data/
+*.pt
+/data
